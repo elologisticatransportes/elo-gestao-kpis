@@ -1350,18 +1350,6 @@ const esc = (s) =>
 window.ELO_DEMO_MODE = false;
 const ELO_API_URL = "https://script.google.com/macros/s/AKfycbwcQPLYfzTZ7OQa3FTwHYA38mXwfsoiilZZKGa5bICioOUIlTpKoDUYeCgJAWeQuopc/exec";
 const ELO_API_TIMEOUT_MS = 45000;
-function trustedGoogleResponseOrigin(origin) {
-  try {
-    const hostname = new URL(origin).hostname;
-    return (
-      hostname === "script.google.com" ||
-      hostname === "script.googleusercontent.com" ||
-      hostname.endsWith(".script.googleusercontent.com")
-    );
-  } catch {
-    return false;
-  }
-}
 function apiRequest(action, args) {
   if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec$/.test(ELO_API_URL))
     return Promise.reject(
@@ -1392,34 +1380,61 @@ function apiRequest(action, args) {
     replyOrigin.name = "replyOrigin";
     replyOrigin.value = window.location.origin;
     form.append(payload, replyOrigin);
-    const cleanup = () => {
-        window.removeEventListener("message", onMessage);
+    let completed = false,
+      pollTimer;
+    const startedAt = Date.now(),
+      pollUrl =
+        ELO_API_URL +
+        "?poll=" +
+        encodeURIComponent(id) +
+        "&replyOrigin=" +
+        encodeURIComponent(window.location.origin),
+      cleanup = () => {
+        completed = true;
+        if (pollTimer) clearTimeout(pollTimer);
         frame.remove();
         form.remove();
       },
-      timer = setTimeout(() => {
+      failOnTimeout = () => {
+        if (Date.now() - startedAt < ELO_API_TIMEOUT_MS) return false;
         cleanup();
         reject(
           new Error(
             "A API não respondeu. Verifique a implantação e a origem autorizada.",
           ),
         );
-      }, ELO_API_TIMEOUT_MS),
-      onMessage = (event) => {
-        if (
-          !trustedGoogleResponseOrigin(event.origin) ||
-          event.data?.source !== "elo-kpi-api" ||
-          event.data?.id !== id
-        )
-          return;
-        clearTimeout(timer);
-        cleanup();
-        if (event.data.ok) resolve(event.data.result);
-        else reject(new Error(event.data.error || "Falha na API."));
+        return true;
+      },
+      poll = async () => {
+        if (completed || failOnTimeout()) return;
+        try {
+          const httpResponse = await fetch(pollUrl + "&_=" + Date.now(), {
+              method: "GET",
+              mode: "cors",
+              cache: "no-store",
+              credentials: "omit",
+            }),
+            data = await httpResponse.json();
+          if (
+            !httpResponse.ok ||
+            data?.source !== "elo-kpi-api" ||
+            data?.id !== id
+          )
+            throw new Error(data?.error || "Resposta inválida da API.");
+          if (data.pending) {
+            pollTimer = setTimeout(poll, 900);
+            return;
+          }
+          cleanup();
+          if (data.ok) resolve(data.result);
+          else reject(new Error(data.error || "Falha na API."));
+        } catch {
+          if (!failOnTimeout()) pollTimer = setTimeout(poll, 1200);
+        }
       };
-    window.addEventListener("message", onMessage);
     document.body.append(frame, form);
     form.submit();
+    pollTimer = setTimeout(poll, 500);
   });
 }
 const server = {
